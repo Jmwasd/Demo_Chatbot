@@ -1,79 +1,117 @@
-import { CognitoIdentityClient } from "@aws-sdk/client-cognito-identity";
+// src/app/api/transcribe/route.ts
+import { NextRequest, NextResponse } from "next/server";
 import {
-  StartStreamTranscriptionCommand,
   TranscribeStreamingClient,
+  StartStreamTranscriptionCommand,
+  AudioStream,
 } from "@aws-sdk/client-transcribe-streaming";
 import { fromCognitoIdentityPool } from "@aws-sdk/credential-provider-cognito-identity";
-import { NextResponse } from "next/server";
+import { CognitoIdentityClient } from "@aws-sdk/client-cognito-identity";
 
-export async function POST(request: Request) {
-  const awsRegion = process.env.AWS_REGION;
+export const runtime = "nodejs";
+
+const MAX_FRAME_SIZE = 4000;
+
+export async function POST(request: NextRequest) {
+  let client: TranscribeStreamingClient | undefined;
+
+  const region = process.env.AWS_REGION;
   const awsID = process.env.IDENTITY_POOL_ID;
 
-  if (!awsID || !awsRegion) {
+  if (!region || !awsID) {
     return NextResponse.json(
       {
-        status: 404,
-        type: "validation",
-        message: "",
-        data: null,
+        transcript: "",
+        status: "validation check",
+        message: "check your aws credentials",
       },
       { status: 400 }
     );
   }
 
-  const client = new TranscribeStreamingClient({
-    region: awsRegion,
-    credentials: fromCognitoIdentityPool({
-      client: new CognitoIdentityClient({ region: awsRegion }),
-      identityPoolId: awsID,
-    }),
-  });
+  try {
+    client = new TranscribeStreamingClient({
+      region: process.env.NEXT_AWS_REGION,
+      credentials: fromCognitoIdentityPool({
+        client: new CognitoIdentityClient({ region: region }),
+        identityPoolId: awsID,
+      }),
+      requestHandler: {
+        timeoutInMs: 10000,
+      },
+    });
 
-  if (!request.body) {
-    return new Response("no body", { status: 400 });
-  }
+    const { audioChunk } = await request.json();
+    const fullBuffer = Buffer.from(audioChunk);
 
-  // 브라우저 → 서버 Audio PCM Stream
-  const browserStream = request.body;
+    const chunks: Buffer[] = [];
+    for (let i = 0; i < fullBuffer.length; i += MAX_FRAME_SIZE) {
+      chunks.push(fullBuffer.slice(i, i + MAX_FRAME_SIZE));
+    }
 
-  async function* audioGen() {
-    const reader = browserStream.getReader();
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      yield { AudioEvent: { AudioChunk: value } };
+    const audioStream: AsyncIterable<AudioStream> = {
+      async *[Symbol.asyncIterator]() {
+        try {
+          for (const chunk of chunks) {
+            yield {
+              AudioEvent: {
+                AudioChunk: chunk,
+              },
+            };
+          }
+        } catch (err) {
+          console.error("Error in audio stream generator:", err);
+          throw err;
+        }
+      },
+    };
+
+    const command = new StartStreamTranscriptionCommand({
+      LanguageCode: "ko-KR",
+      MediaEncoding: "pcm",
+      MediaSampleRateHertz: 44100,
+      AudioStream: audioStream,
+    });
+
+    const response = await client.send(command);
+    let transcriptResult = "";
+
+    if (response.TranscriptResultStream) {
+      try {
+        for await (const event of response.TranscriptResultStream) {
+          if (event.TranscriptEvent?.Transcript?.Results?.[0]) {
+            const result = event.TranscriptEvent.Transcript.Results[0];
+            if (result.Alternatives?.[0]?.Transcript) {
+              transcriptResult = result.Alternatives[0].Transcript;
+            }
+          }
+        }
+      } catch (streamError) {
+        console.error("Error processing transcript stream:", streamError);
+        if (transcriptResult) {
+          return NextResponse.json({ transcript: transcriptResult });
+        }
+        throw streamError;
+      }
+    }
+
+    return NextResponse.json({ transcript: transcriptResult });
+  } catch (error) {
+    return NextResponse.json(
+      {
+        transcript: "",
+        status: "warning",
+        message: "error : " + error,
+      },
+      { status: 400 }
+    );
+  } finally {
+    if (client) {
+      try {
+        await client.destroy();
+      } catch (destroyError) {
+        console.error("Error destroying client:", destroyError);
+      }
     }
   }
-
-  const command = new StartStreamTranscriptionCommand({
-    LanguageCode: "ko-KR",
-    MediaEncoding: "pcm",
-    MediaSampleRateHertz: 16000,
-    AudioStream: audioGen(),
-  });
-
-  const response = await client.send(command);
-
-  const encoder = new TextEncoder();
-
-  // AWS → 브라우저 텍스트 스트링 반환
-  const stream = new ReadableStream({
-    async start(controller) {
-      for await (const event of response.TranscriptResultStream || []) {
-        const text =
-          event.TranscriptEvent?.Transcript?.Results?.[0]?.Alternatives?.[0]
-            ?.Transcript;
-
-        if (text) {
-          controller.enqueue(encoder.encode(text));
-        }
-      }
-      controller.close();
-    },
-  });
-
-  return new Response(stream, {
-    headers: { "Content-Type": "text/plain" },
-  });
 }
