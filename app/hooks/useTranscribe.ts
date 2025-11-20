@@ -3,171 +3,75 @@
 
 import MicrophoneStream from "microphone-stream";
 import { useState, useRef } from "react";
-import update from "immutability-helper";
 import { Buffer } from "buffer";
+import { Readable } from "stream";
 
-const pcmEncodeChunk = (chunk: Buffer) => {
-  const input = MicrophoneStream.toRaw(chunk);
-  let offset = 0;
-  const buffer = new ArrayBuffer(input.length * 2);
+function encodePCM16(raw: Float32Array) {
+  const buffer = new ArrayBuffer(raw.length * 2);
   const view = new DataView(buffer);
-  for (let i = 0; i < input.length; i++, offset += 2) {
-    const s = Math.max(-1, Math.min(1, input[i]));
+
+  let offset = 0;
+  for (let i = 0; i < raw.length; i++, offset += 2) {
+    const s = Math.max(-1, Math.min(1, raw[i])); // Clamp
     view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
   }
-  return Buffer.from(buffer);
-};
+
+  return Buffer.from(buffer); // 반드시 Buffer 리턴
+}
 
 const useTranscribe = () => {
-  const [micStream, setMicStream] = useState<MicrophoneStream | undefined>();
+  const wsRef = useRef<WebSocket | null>(null);
+  const micRef = useRef<any>(null);
   const [recording, setRecording] = useState(false);
   const [error, setError] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string>("");
-  const [transcripts, setTranscripts] = useState<
-    {
-      isPartial: boolean;
-      transcript: string;
-    }[]
-  >([]);
-  const abortControllerRef = useRef<AbortController | null>(null);
-
-  const startStream = async (mic: MicrophoneStream) => {
-    abortControllerRef.current = new AbortController();
-    const signal = abortControllerRef.current.signal;
-
-    let accumulatedChunks: Buffer[] = [];
-    const SEND_INTERVAL_MS = 500;
-    let lastSendTime = Date.now();
-
-    for await (const chunk of mic as unknown as Buffer[]) {
-      // Check if the stream has been aborted
-      if (signal.aborted) {
-        break;
-      }
-
-      try {
-        const encodedChunk = pcmEncodeChunk(chunk);
-
-        // Add to accumulated buffer
-        accumulatedChunks.push(encodedChunk);
-
-        const currentTime = Date.now();
-        // Only send if we've accumulated enough time or data
-        if (currentTime - lastSendTime >= SEND_INTERVAL_MS) {
-          // Combine all accumulated chunks
-          const combinedChunk = Buffer.concat(accumulatedChunks);
-
-          const response = await fetch("/api/transcribe", {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-            },
-            body: JSON.stringify({
-              audioChunk: Array.from(combinedChunk),
-            }),
-            signal,
-          });
-
-          // Reset accumulation
-          accumulatedChunks = [];
-          lastSendTime = currentTime;
-
-          if (!response.ok) {
-            throw new Error(`Transcription request failed: ${response.status}`);
-          }
-
-          const data = await response.json();
-          if (data.status === "warning") {
-            console.warn("Transcription warning:", data.message);
-          }
-
-          if (data.transcript) {
-            setTranscripts((prev) => {
-              const index = prev.length - 1;
-              if (prev.length === 0 || !prev[prev.length - 1].isPartial) {
-                return update(prev, {
-                  $push: [{ isPartial: false, transcript: data.transcript }],
-                });
-              } else {
-                return update(prev, {
-                  $splice: [
-                    [
-                      index,
-                      1,
-                      { isPartial: false, transcript: data.transcript },
-                    ],
-                  ],
-                });
-              }
-            });
-          }
-        }
-      } catch (e) {
-        if (e instanceof DOMException && e.name === "AbortError") {
-          console.log("Fetch request aborted");
-          continue;
-        }
-
-        setError(true);
-        setErrorMessage(e instanceof Error ? e.message : String(e));
-        break;
-      }
-    }
-  };
+  const [transcripts, setTranscripts] = useState<string[]>([]);
 
   const startTranscription = async () => {
-    const mic = new MicrophoneStream();
-    try {
-      setMicStream(mic);
-      const stream = await window.navigator.mediaDevices.getUserMedia({
-        video: false,
-        audio: {
-          channelCount: 1,
-          sampleRate: 44100,
-        },
-      });
+    await fetch("/api/transcribe"); // WebSocket 서버 준비 호출
 
-      mic.setStream(stream);
+    const ws = new WebSocket("ws://localhost:3001");
+    ws.binaryType = "arraybuffer";
+    wsRef.current = ws;
 
-      setError(false);
-      setErrorMessage("");
-      setTranscripts([]);
+    ws.onmessage = (msg) => {
+      setTranscripts((prev) => [...prev, msg.data]);
       setRecording(true);
-      await startStream(mic);
-    } catch (e) {
-      console.error("Error starting transcription:", e);
-      setError(true);
-      setErrorMessage(e instanceof Error ? e.message : String(e));
-    } finally {
-      if (mic) {
-        try {
-          mic.stop();
-        } catch (stopError) {
-          console.error("Error stopping microphone:", stopError);
-        }
+    };
+
+    const mic = new MicrophoneStream();
+    micRef.current = mic;
+
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: true,
+      video: false,
+    });
+
+    mic.setStream(stream);
+
+    (mic as unknown as Readable).on(
+      "data",
+      (chunk: Buffer<ArrayBufferLike>) => {
+        const raw = MicrophoneStream.toRaw(chunk);
+        if (!raw) return;
+
+        const pcmBuffer = encodePCM16(raw);
+        wsRef.current?.send(pcmBuffer);
       }
-      setRecording(false);
-      setMicStream(undefined);
-    }
+    );
   };
 
   const stopTranscription = () => {
-    if (abortControllerRef.current) {
-      abortControllerRef.current.abort();
-      abortControllerRef.current = null;
-    }
-
-    if (micStream) {
-      micStream.stop();
-      setRecording(false);
-      setMicStream(undefined);
-    }
+    micRef.current?.stop();
+    wsRef.current?.close();
+    setRecording(false);
   };
 
   const resetTranscripts = () => {
     setError(false);
     setErrorMessage("");
     setTranscripts([]);
+    setRecording(false);
   };
 
   return {
