@@ -3,28 +3,22 @@
 import useTranscribe from "../hooks/useTranscribe";
 
 const StreamingAudio = () => {
-  const { startTranscription, stopTranscription, transcripts } =
+  const { startTranscription, stopTranscription, recording, transcripts } =
     useTranscribe();
 
-  const onStartRecord = async () => {
-    startTranscription();
-  };
-
-  const onStopRecord = async () => {
-    stopTranscription();
-  };
-
-  const getTranscribeText = () => {
-    const text = transcripts.map((el) => el.transcript);
-    return text.join("");
+  const onRecordClick = () => {
+    recording ? stopTranscription() : startTranscription();
   };
 
   return (
     <div>
-      <button onClick={onStartRecord}>Start</button>
-      <button onClick={onStopRecord}>Stop</button>
+      <button onClick={onRecordClick}>{recording ? "Pause" : "Start"}</button>
 
-      <div>{getTranscribeText()}</div>
+      <div>
+        {transcripts.map((el, idx) => (
+          <p key={idx}>{el}</p>
+        ))}
+      </div>
     </div>
   );
 };

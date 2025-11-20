@@ -1,117 +1,128 @@
-// src/app/api/transcribe/route.ts
-import { NextRequest, NextResponse } from "next/server";
+import { CognitoIdentityClient } from "@aws-sdk/client-cognito-identity";
 import {
-  TranscribeStreamingClient,
   StartStreamTranscriptionCommand,
+  TranscribeStreamingClient,
   AudioStream,
 } from "@aws-sdk/client-transcribe-streaming";
 import { fromCognitoIdentityPool } from "@aws-sdk/credential-provider-cognito-identity";
-import { CognitoIdentityClient } from "@aws-sdk/client-cognito-identity";
+import { WebSocketServer } from "ws";
+import { NextResponse } from "next/server";
 
 export const runtime = "nodejs";
 
-const MAX_FRAME_SIZE = 4000;
+let wss: WebSocketServer | null = null;
 
-export async function POST(request: NextRequest) {
-  let client: TranscribeStreamingClient | undefined;
+class AudioQueue {
+  private queue: Buffer[] = [];
+  private resolver: ((value: Buffer | undefined) => void) | null = null;
 
-  const region = process.env.AWS_REGION;
-  const awsID = process.env.IDENTITY_POOL_ID;
-
-  if (!region || !awsID) {
-    return NextResponse.json(
-      {
-        transcript: "",
-        status: "validation check",
-        message: "check your aws credentials",
-      },
-      { status: 400 }
-    );
+  enqueue(chunk: Buffer) {
+    if (this.resolver) {
+      this.resolver(chunk);
+      this.resolver = null;
+    } else {
+      this.queue.push(chunk);
+    }
   }
 
-  try {
-    client = new TranscribeStreamingClient({
-      region: process.env.NEXT_AWS_REGION,
-      credentials: fromCognitoIdentityPool({
-        client: new CognitoIdentityClient({ region: region }),
-        identityPoolId: awsID,
-      }),
-      requestHandler: {
-        timeoutInMs: 10000,
-      },
-    });
+  async *generator(): AsyncGenerator<AudioStream> {
+    while (true) {
+      const chunk =
+        this.queue.length > 0
+          ? this.queue.shift()
+          : await new Promise<Buffer | undefined>((resolve) => {
+              this.resolver = resolve;
+            });
 
-    const { audioChunk } = await request.json();
-    const fullBuffer = Buffer.from(audioChunk);
+      if (!chunk) break;
 
-    const chunks: Buffer[] = [];
-    for (let i = 0; i < fullBuffer.length; i += MAX_FRAME_SIZE) {
-      chunks.push(fullBuffer.slice(i, i + MAX_FRAME_SIZE));
+      yield {
+        AudioEvent: {
+          AudioChunk: chunk,
+        },
+      };
+    }
+  }
+}
+
+function createTranscribeClient() {
+  const region = process.env.AWS_REGION;
+  const poolId = process.env.IDENTITY_POOL_ID;
+
+  if (!region || !poolId) return null;
+
+  return new TranscribeStreamingClient({
+    region,
+    credentials: fromCognitoIdentityPool({
+      client: new CognitoIdentityClient({ region }),
+      identityPoolId: poolId,
+    }),
+  });
+}
+
+function startWSS() {
+  if (wss) return;
+
+  wss = new WebSocketServer({ port: 3001 });
+  console.log("WS Server Started on 3001");
+
+  wss.on("connection", async (ws) => {
+    console.log("connected");
+
+    const transcribeClient = createTranscribeClient();
+
+    if (!transcribeClient) {
+      return;
     }
 
-    const audioStream: AsyncIterable<AudioStream> = {
-      async *[Symbol.asyncIterator]() {
-        try {
-          for (const chunk of chunks) {
-            yield {
-              AudioEvent: {
-                AudioChunk: chunk,
-              },
-            };
-          }
-        } catch (err) {
-          console.error("Error in audio stream generator:", err);
-          throw err;
-        }
-      },
-    };
+    const audioQueue = new AudioQueue();
 
     const command = new StartStreamTranscriptionCommand({
       LanguageCode: "ko-KR",
       MediaEncoding: "pcm",
       MediaSampleRateHertz: 44100,
-      AudioStream: audioStream,
+      AudioStream: audioQueue.generator(),
     });
 
-    const response = await client.send(command);
-    let transcriptResult = "";
+    const responsePromise = transcribeClient.send(command);
 
-    if (response.TranscriptResultStream) {
-      try {
-        for await (const event of response.TranscriptResultStream) {
-          if (event.TranscriptEvent?.Transcript?.Results?.[0]) {
-            const result = event.TranscriptEvent.Transcript.Results[0];
-            if (result.Alternatives?.[0]?.Transcript) {
-              transcriptResult = result.Alternatives[0].Transcript;
+    ws.on("message", (chunk: Buffer<ArrayBuffer>) => {
+      audioQueue.enqueue(chunk);
+    });
+
+    (async () => {
+      const response = await responsePromise;
+
+      if (response.TranscriptResultStream) {
+        try {
+          for await (const event of response.TranscriptResultStream) {
+            if (event.TranscriptEvent?.Transcript?.Results?.[0]) {
+              const result = event.TranscriptEvent.Transcript.Results[0];
+              if (result.Alternatives?.[0]?.Transcript) {
+                const transcriptResult = result.Alternatives[0].Transcript;
+
+                const isPartial = result.IsPartial;
+
+                if (!isPartial) ws.send(transcriptResult);
+              }
             }
           }
-        }
-      } catch (streamError) {
-        console.error("Error processing transcript stream:", streamError);
-        if (transcriptResult) {
-          return NextResponse.json({ transcript: transcriptResult });
-        }
-        throw streamError;
-      }
-    }
+        } catch (streamError) {
+          console.error("Error processing transcript stream:", streamError);
 
-    return NextResponse.json({ transcript: transcriptResult });
-  } catch (error) {
-    return NextResponse.json(
-      {
-        transcript: "",
-        status: "warning",
-        message: "error : " + error,
-      },
-      { status: 400 }
-    );
-  } finally {
-    if (client) {
-      try {
-        await client.destroy();
-      } catch (destroyError) {
-        console.error("Error destroying client:", destroyError);
+          throw streamError;
+        }
       }
-    }
-  }
+    })();
+
+    ws.on("close", () => {
+      console.log("disconnected");
+      audioQueue.enqueue(Buffer.alloc(0));
+    });
+  });
+}
+
+export function GET() {
+  startWSS();
+  return NextResponse.json({ message: "WebSocket STT server running" });
 }
