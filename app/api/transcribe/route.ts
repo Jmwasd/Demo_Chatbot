@@ -117,6 +117,7 @@ function startWSS() {
 
     ws.on("close", () => {
       console.log("disconnected");
+      transcribeClient.destroy();
       audioQueue.enqueue(Buffer.alloc(0));
     });
   });
