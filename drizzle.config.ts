@@ -1,7 +1,5 @@
 import type { Config } from "drizzle-kit";
 
-console.log(process.env.DATABASE_URL);
-
 export default {
   schema: "./lib/db/schema",
   dialect: "postgresql",
