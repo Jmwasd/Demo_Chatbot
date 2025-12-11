@@ -3,6 +3,10 @@
 import { useChat } from "@ai-sdk/react";
 import { Input } from "@/components/ui/input";
 import { FormEvent, useRef } from "react";
+import { Amplify } from "aws-amplify";
+import outputs from "@/amplify_outputs.json";
+
+Amplify.configure(outputs);
 
 const ChatAI = () => {
   const input = useRef<HTMLInputElement | null>(null);
