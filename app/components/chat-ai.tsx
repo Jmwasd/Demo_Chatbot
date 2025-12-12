@@ -3,10 +3,6 @@
 import { useChat } from "@ai-sdk/react";
 import { Input } from "@/components/ui/input";
 import { FormEvent, useRef } from "react";
-import { Amplify } from "aws-amplify";
-import outputs from "@/amplify_outputs.json";
-
-Amplify.configure(outputs);
 
 const ChatAI = () => {
   const input = useRef<HTMLInputElement | null>(null);
@@ -31,17 +27,17 @@ const ChatAI = () => {
                 switch (part.type) {
                   case "text":
                     return <p key={idx}>{part.text}</p>;
-                  case "tool-addResource":
-                  case "tool-getInformation":
-                    return (
-                      <p key={idx}>
-                        call{part.state === "output-available" ? "ed" : "ing"}{" "}
-                        tool: {part.type}
-                        <pre className="my-4 bg-zinc-100 p-2 rounded-sm">
-                          {JSON.stringify(part.input, null, 2)}
-                        </pre>
-                      </p>
-                    );
+                  // case "tool-addResource":
+                  // case "tool-getInformation":
+                  //   return (
+                  //     <p key={idx}>
+                  //       call{part.state === "output-available" ? "ed" : "ing"}{" "}
+                  //       tool: {part.type}
+                  //       <pre className="my-4 bg-zinc-100 p-2 rounded-sm">
+                  //         {JSON.stringify(part.input, null, 2)}
+                  //       </pre>
+                  //     </p>
+                  //   );
                 }
               })}
             </div>
