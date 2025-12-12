@@ -3,7 +3,7 @@ import { db } from "../db";
 import { cosineDistance, desc, gt, sql } from "drizzle-orm";
 import { embeddings } from "../db/schema/embeddings";
 
-const embeddingModel = "gemini-embedding-001";
+const embeddingModel = "openai/text-embedding-ada-002";
 
 const generateChunks = (input: string): string[] => {
   return input
